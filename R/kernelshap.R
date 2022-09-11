@@ -21,6 +21,7 @@
 #' dimension separately until iteration stops.
 #' 
 #' @importFrom doRNG %dorng%
+#' @import glmnet
 #' 
 #' @param object Fitted model object.
 #' @param X A (n x p) matrix, data.frame, tibble or data.table of rows to be explained. 
@@ -51,6 +52,10 @@
 #' uses \code{exact = TRUE} for up to eight features. If \code{TRUE},
 #' the arguments \code{m}, \code{paired_sampling}, \code{tol}, and \code{max_iter} 
 #' are ignored.
+#' @param l1 Optional feature selection for sparse explanations. The default \code{NULL}
+#' applies no regularization. Alternatives include \code{"aic"} and \code{"bic"} for
+#' adaptive solutions, or some fixed integer less than p, in which case Shapley values
+#' are calculated for only the top \code{l1} features. See example below.
 #' @param tol Tolerance determining when to stop. The algorithm keeps iterating until
 #' max(sigma_n) / diff(range(beta_n)) < tol, where the beta_n are the SHAP values 
 #' of a given observation and sigma_n their standard errors. For multidimensional
@@ -92,6 +97,10 @@
 #' s <- kernelshap(fit, iris[1:2, -1], bg_X = iris)
 #' s
 #' 
+#' # Just the top two features
+#' s <- kernelshap(fit, iris[1:2, -1], bg_X = iris, l1 = 2)
+#' s
+#' 
 #' # Multivariate model
 #' fit <- stats::lm(
 #'   as.matrix(iris[1:2]) ~ Petal.Length + Petal.Width + Species, data = iris
@@ -121,6 +130,7 @@
 #' s <- kernelshap(fit, iris[1:2], bg_X = iris, type = "response")
 #' s
 #' 
+
 kernelshap <- function(object, ...){
   UseMethod("kernelshap")
 }
@@ -129,7 +139,7 @@ kernelshap <- function(object, ...){
 #' @export
 kernelshap.default <- function(object, X, bg_X, pred_fun = stats::predict, bg_w = NULL, 
                                paired_sampling = TRUE, m = "auto", exact = "auto", 
-                               tol = 0.01, max_iter = 250, parallel = FALSE, 
+                               l1 = NULL, tol = 0.01, max_iter = 250, parallel = FALSE, 
                                parallel_args = NULL, verbose = TRUE, ...) {
   stopifnot(
     is.matrix(X) || is.data.frame(X),
@@ -177,7 +187,7 @@ kernelshap.default <- function(object, X, bg_X, pred_fun = stats::predict, bg_w 
     if (verbose) {
       message("Calculating exact Kernel SHAP values")
     }
-    m <- 2^p - 2
+    m <- 2L^p - 2L
   } else {
     if (verbose) {
       message("Calculating Kernel SHAP values by iterative sampling")
@@ -188,7 +198,7 @@ kernelshap.default <- function(object, X, bg_X, pred_fun = stats::predict, bg_w 
   }
   # Make sure that m / 2 is integer in the paired case
   if (paired_sampling) {
-    m <- 2 * trunc(m / 2)
+    m <- 2L * trunc(m / 2L)
   }
   ex <- if (exact) exact_input(p)
 
@@ -210,6 +220,7 @@ kernelshap.default <- function(object, X, bg_X, pred_fun = stats::predict, bg_w 
       m = m,
       exact = exact,
       ex = ex,
+      l1 = l1,
       tol = tol,
       max_iter = max_iter,
       ...
@@ -232,6 +243,7 @@ kernelshap.default <- function(object, X, bg_X, pred_fun = stats::predict, bg_w 
         m = m,
         exact = exact,
         ex = ex,
+        l1 = l1,
         tol = tol,
         max_iter = max_iter,
         ...

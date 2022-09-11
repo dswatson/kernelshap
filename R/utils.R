@@ -1,7 +1,12 @@
 # Kernel SHAP algorithm for a single row x with paired sampling
 kernelshap_one <- function(object, X, bg_X, pred_fun, bg_w, v0, v1, 
-                           paired, m, exact, ex, tol, max_iter, ...) {
+                           paired, m, exact, ex, l1, tol, max_iter, ...) {
   p <- ncol(X)
+  k <- ncol(v0)
+  if (is.null(l1)) {
+    keep <- 1:p
+  }
+  beta <- sigma <- matrix(0, nrow = p, ncol = k)
   v0_ext <- v0[rep(1L, m), , drop = FALSE]                        #  (m x K)
   
   if (exact) {
@@ -9,9 +14,13 @@ kernelshap_one <- function(object, X, bg_X, pred_fun, bg_w, v0, v1,
     vz <- get_vz(                                                 #  (m x K)
       X = X, bg = bg_X, Z = Z, object = object, pred_fun = pred_fun, w = bg_w, ...
     )
+    if (!is.null(l1)) {
+      keep <- l1_reg(Z, vz, v0_ext, l1)
+    }
     # Note: w is correctly replicated along columns of (vz - v0_ext)
-    b <- crossprod(Z, ex[["w"]] * (vz - v0_ext))                  #  (p x K)
-    beta <- solver(ex[["A"]], b, constraint = v1 - v0)            #  (p x K)
+    b <- crossprod(Z[, keep], ex[["w"]] * (vz - v0_ext))         #  (p x K)
+    beta[keep, ] <- solver(ex[["A"]][keep, keep], b, 
+                           constraint = v1 - v0)                 #  (p x K)
     
     return(list(beta = beta, sigma = 0 * beta, n_iter = 1L, converged = TRUE))
   }
@@ -21,7 +30,7 @@ kernelshap_one <- function(object, X, bg_X, pred_fun, bg_w, v0, v1,
   converged <- FALSE
   n_iter <- 0L
   Asum <- matrix(0, nrow = p, ncol = p)                           #  (p x p)
-  bsum <- matrix(0, nrow = p, ncol = ncol(v0))                    #  (p x K)
+  bsum <- matrix(0, nrow = p, ncol = k)                           #  (p x K)
   
   while(!isTRUE(converged) && n_iter < max_iter) {
     n_iter <- n_iter + 1L
@@ -31,11 +40,17 @@ kernelshap_one <- function(object, X, bg_X, pred_fun, bg_w, v0, v1,
     vz <- get_vz(
       X = X, bg = bg_X, Z = Z, object = object, pred_fun = pred_fun, w = bg_w, ...
     )
+    if (!is.null(l1) && n_iter == 1) {
+      keep <- l1_reg(Z, vz, v0_ext, l1)
+      Asum <- Asum[keep, keep]
+      bsum <- bsum[keep, ]
+    } 
     
     # Least-squares with constraint that beta_1 + ... + beta_p = v_1 - v_0. 
     # The additional constraint beta_0 = v_0 is dealt via offset
     Atemp <- crossprod(Z) / m                                     #  (p x p)
-    btemp <- crossprod(Z, (vz - v0_ext)) / m                      #  (p x K)
+    Atemp <- Atemp[keep, keep]
+    btemp <- crossprod(Z[, keep], (vz - v0_ext)) / m              #  (p x K)
     Asum <- Asum + Atemp                                          #  (p x p)
     bsum <- bsum + btemp                                          #  (p x K)
     
@@ -49,7 +64,9 @@ kernelshap_one <- function(object, X, bg_X, pred_fun, bg_w, v0, v1,
       converged <- all(conv_crit(sigma_n, beta_n) < tol)
     }
   }
-  list(beta = beta_n, sigma = sigma_n, n_iter = n_iter, converged = converged)
+  beta[keep, ] <- beta_n
+  sigma[keep, ] <- sigma_n
+  return(list(beta = beta, sigma = sigma, n_iter = n_iter, converged = converged))
 }
 
 # Regression coefficients given sum(beta) = constraint
@@ -169,3 +186,39 @@ kernel_weights <- function(p) {
   probs / sum(probs)
 }
 
+# Optional feature selection function
+l1_reg <- function(Z, vz, v0_ext, l1) {
+  # Fit weighted lasso
+  n <- nrow(Z)
+  p <- ncol(Z)
+  w <- kernel_weights(p) / choose(p, 1:(p - 1L))
+  w <- w[rowSums(Z)]
+  w <- w / sum(w) * n
+  y <- as.numeric(vz - v0_ext)
+  fit <- glmnet(x = Z, y = y, weights = w, intercept = FALSE)
+  if (l1 %in% c('aic', 'bic')) {
+    # Compute information criteria for adaptive feature selection
+    y_hat <- predict.glmnet(fit, newx = Z, s = fit$lambda)
+    eps <- y_hat - y
+    rmse <- sqrt(colMeans(eps^2))
+    ll <- sapply(seq_len(length(fit$lambda)), function(l) {
+      sum(dnorm(eps[, l], sd = rmse[l], log = TRUE))
+    })
+    aic <- 2 * fit$df - 2 * ll
+    bic <- log(n) * fit$df - 2 * ll
+    k <- ifelse(l1 == 'aic', which.min(aic), which.min(bic))
+    keep <- predict.glmnet(fit, s = fit$lambda[k], type = 'nonzero')$s1
+  } else {
+    # Or select some fixed number of features. This can be tricky when
+    # no value of lambda delivers precisely the target number of nonzeros
+    if (l1 %in% fit$df) {
+      k <- max(which(fit$df == l1))
+      keep <- predict.glmnet(fit, s = fit$lambda[k], type = 'nonzero')$s1
+    } else {
+      k <- min(which(fit$df >= l1))
+      beta <- abs(as.numeric(coef.glmnet(fit, s = fit$lambda[k])))
+      keep <- order(beta, decreasing = TRUE)[1:l1]
+    }
+  }
+  return(keep)
+}

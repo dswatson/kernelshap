@@ -18,6 +18,7 @@ kernelshap(object, ...)
   paired_sampling = TRUE,
   m = "auto",
   exact = "auto",
+  l1 = NULL,
   tol = 0.01,
   max_iter = 250,
   parallel = FALSE,
@@ -96,6 +97,11 @@ uses \code{exact = TRUE} for up to eight features. If \code{TRUE},
 the arguments \code{m}, \code{paired_sampling}, \code{tol}, and \code{max_iter}
 are ignored.}
 
+\item{l1}{Optional feature selection for sparse explanations. The default \code{NULL}
+applies no regularization. Alternatives include \code{"aic"} and \code{"bic"} for
+adaptive solutions, or some fixed integer less than p, in which case Shapley values
+are calculated for only the top \code{l1} features. See example below.}
+
 \item{tol}{Tolerance determining when to stop. The algorithm keeps iterating until
 max(sigma_n) / diff(range(beta_n)) < tol, where the beta_n are the SHAP values
 of a given observation and sigma_n their standard errors. For multidimensional
@@ -166,6 +172,10 @@ dimension separately until iteration stops.
 # Linear regression
 fit <- stats::lm(Sepal.Length ~ ., data = iris)
 s <- kernelshap(fit, iris[1:2, -1], bg_X = iris)
+s
+
+# Just the top two features
+s <- kernelshap(fit, iris[1:2, -1], bg_X = iris, l1 = 2)
 s
 
 # Multivariate model
