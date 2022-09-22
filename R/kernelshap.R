@@ -1,24 +1,52 @@
 #' Kernel SHAP
 #'
-#' Implements a multidimensional version of the Kernel SHAP algorithm explained in 
-#' detail in Covert and Lee (2021). It is an iterative refinement of the original 
-#' Kernel SHAP algorithm of Lundberg and Lee (2017). The algorithm is applied to each 
-#' row in \code{X}. Its behaviour depends on the number of features p:
+#' Multidimensional refinement of the Kernel SHAP Algorithm described in Covert and Lee (2021), 
+#' in the following abbreviated by "CL21". 
+#' The function allows to calculate Kernel SHAP values in an exact way, by iterative sampling 
+#' as in CL21, or by a hybrid of these two options. As soon as sampling is involved, 
+#' the algorithm iterates until convergence, and standard errors are provided.
+#' The default behaviour depends on the number of features p:
 #' \itemize{
-#'   \item 2 <= p <= 8: Exact Kernel SHAP values are returned. 
-#'   (Exact regarding the given background data.)
-#'   \item p > 8: Sampling version of Kernel SHAP. 
-#'   The algorithm iterates until Kernel SHAP values are sufficiently accurate. 
-#'   Approximate standard errors of the SHAP values are returned. 
-#'   \item p = 1: Exact Shapley values are returned.
+#'   \item 2 <= p <= 8: Exact Kernel SHAP values are returned (for the given background data). 
+#'   \item p > 8: Hybrid (partly exact) iterative version of Kernel SHAP
+#'   (degree 2 up to p = 16, degree 1 for p > 16, see Details).
+#'   \item p = 1: Exact Shapley values are returned (independent of the background data).
 #' }
 #' 
-#' During each iteration, \code{m} on-off vectors (feature subsets) are evaluated until 
-#' the worst standard error of the SHAP values is small enough relative to the range of 
-#' the SHAP values. This stopping criterion was suggested in Covert and Lee (2021) and 
-#' uses the fact that SHAP values and their standard errors are all on the scale of the 
-#' predictions. In the multi-output case, the criterion must be fulfilled for each 
-#' dimension separately until iteration stops.
+#' The iterative Kernel SHAP sampling algorithm (CL21) works by randomly sample 
+#' m on-off vectors z so that their sum follows the SHAP Kernel weight distribution 
+#' (renormalized to the range from 1 to p-1). Based on these vectors, many predictions 
+#' are formed. Then, Kernel SHAP values are derived as the solution of a constrained 
+#' linear regression. This is done multiple times until convergence, see CL21 for details.
+#' 
+#' A drawback of this strategy is that many (at least 75%) of the z vectors will have 
+#' sum(z) equal to 1 or p-1, producing many duplicates. Similarly, at least 92% of 
+#' the mass will be used for the p(p+1) possible vectors with sum(z) in 1, 2, p-1, p-2. 
+#' This inefficiency can be fixed by a hybrid strategy, combining exact calculations with sampling.
+#' 
+#' The hybrid algorithm has two steps:
+#' \enumerate{
+#'   \item Step 1 (exact part): There are 2p different on-off vectors z with sum(z) equals to 
+#'   1 or p-1, covering a large proportion of the Kernel SHAP distribution. 
+#'   The degree 1 hybrid will list those vectors and use them according to their weights 
+#'   in the upcoming calculations. Depending on p, we can also go a step further to 
+#'   a degree 2 hybrid by adding all p(p-1) vectors with sum(z) equals to 2 or p-2
+#'   to the process etc. The necessary predictions are obtained along with other 
+#'   calculations similar to those described in CL21.
+#'   \item Step 2 (sampling part): The remaining weight is filled by sampling vectors z
+#'   according to Kernel SHAP weights renormalized to the values not yet covered by Step 1. 
+#'   Together with the results from Step 1 - correctly weighted - this now forms a
+#'   complete iteration as in CL21. The difference is that most mass is covered by exact calculations. 
+#'   Afterwards, the algorithm iterates until convergence. The output of Step 1 is reused
+#'   in every iteration, leading to an extremely efficient strategy.
+#' }
+#' 
+#' If p is sufficiently small, then all possible 2^p-2 on-off vectors z can be evaluated.
+#' In this case, no sampling is required and the algorithm returns exact Kernel SHAP values 
+#' regarding the given background data. Since \code{kernelshap()} calculates predictions 
+#' on data with MN rows (N is the background data size and M the number of z vectors),
+#' p should probably not be much higher than 10. The same problem occurs with hybrid of
+#' degree 2 and p larger than 30-40. There, M = p(p + 1).
 #' 
 #' @importFrom doRNG %dorng%
 #' @import glmnet
@@ -27,7 +55,7 @@
 #' @param X A (n x p) matrix, data.frame, tibble or data.table of rows to be explained. 
 #' Important: The columns should only represent model features, not the response.
 #' @param bg_X Background data used to integrate out "switched off" features, 
-#' often a subset of the training data (around 100 to 200 rows)
+#' often a subset of the training data (around 100 to 500 rows)
 #' It should contain the same columns as \code{X}. Columns not in \code{X} are silently 
 #' dropped and the columns are arranged into the order as they appear in \code{X}.
 #' @param pred_fun Prediction function of the form \code{function(object, X, ...)},
@@ -38,32 +66,45 @@
 #' work in most cases. Some exceptions (classes "ranger" and mlr3 "Learner")
 #' are handled separately. In other cases, the function must be specified manually.
 #' @param bg_w Optional vector of case weights for each row of \code{bg_X}.
-#' @param paired_sampling Logical flag indicating whether to use paired sampling.
-#' The default is \code{TRUE}. This means that with every on-off vector,
-#' also its complement is evaluated, which leads to considerably faster convergence.
-#' Ignored if exact calculations are done.
-#' @param m Number of on-off vectors to be evaluated during one iteration. 
-#' The default, "auto", equals \code{2*max(trunc(20*sqrt(p)), 5*p)}, where p is the
-#' number of features. Ignored if exact calculations are done.
 #' @param exact If \code{TRUE}, the algorithm will produce exact Kernel SHAP values
-#' with respect to the given background data. Note that the algorithm works with large
-#' prediction data having (2^p-2) * nrow(bg_X) rows, where p is the number of features.
-#' Thus, if p > 10, we recommend to set \code{exact = FALSE}. The default \code{"auto"}
-#' uses \code{exact = TRUE} for up to eight features. If \code{TRUE},
-#' the arguments \code{m}, \code{paired_sampling}, \code{tol}, and \code{max_iter} 
-#' are ignored.
+#' with respect to the background data. In this case, the arguments \code{hybrid_degree}, 
+#' \code{m}, \code{paired_sampling}, \code{tol}, and \code{max_iter} are ignored.
+#' The default is \code{TRUE} up to eight features, and \code{FALSE} otherwise. 
 #' @param l1 Optional feature selection for sparse explanations. The default \code{NULL}
 #' applies no regularization. Alternatives include \code{"aic"} and \code{"bic"} for
 #' adaptive solutions, or some fixed integer less than p, in which case Shapley values
 #' are calculated for only the top \code{l1} features. See example below.
+#' @param hybrid_degree Integer controlling the exactness of the hybrid strategy. For
+#' 4 <= p <= 16, the default is 2, otherwise it is 1. Ignored if \code{exact = TRUE}.
+#' \itemize{
+#'   \item \code{0}: Pure sampling strategy not involving any exact part. It is strictly
+#'   worse than the hybrid strategy and should therefore only be used for 
+#'   studying properties of the Kernel SHAP algorithm.
+#'   \item \code{1}: Uses all 2p on-off vectors z with sum(z) equal to 1 or p-1 for the exact 
+#'   part, which covers at least 75% of the mass of the Kernel weight distribution. 
+#'   The remaining mass is covered by sampling.
+#'   \item \code{2}: Uses all p(p+1) on-off vectors z with sum(z) equal to 1, p-1, 2, or p-2. 
+#'   This covers at least 92% of the mass of the Kernel weight distribution. 
+#'   The remaining mass is covered by sampling. Convergence usually happens in the 
+#'   minimal possible number of iterations of two.
+#'   \item \code{k>2}: Uses all on-off vectors with sum(z) in 1,...,k and p-1,...,p-k.
+#' }
+#' @param paired_sampling Logical flag indicating whether to do the sampling in a paired
+#' manner. This means that with every on-off vector z, also 1-z is considered.
+#' CL21 shows its superiority compared to standard sampling, therefore the 
+#' default (\code{TRUE}) should usually not be changed except for studying properties
+#' of Kernel SHAP algorithms. Ignored if \code{exact = TRUE}.
+#' @param m Even number of on-off vectors sampled during one iteration. 
+#' The default is 2p, except when \code{hybrid_degree == 0}. Then it is set to 8p. 
+#' Ignored if \code{exact = TRUE}.
 #' @param tol Tolerance determining when to stop. The algorithm keeps iterating until
-#' max(sigma_n) / diff(range(beta_n)) < tol, where the beta_n are the SHAP values 
-#' of a given observation and sigma_n their standard errors. For multidimensional
+#' max(sigma_n)/diff(range(beta_n)) < tol, where the beta_n are the SHAP values 
+#' of a given observation and sigma_n their standard errors, see CL21. For multidimensional
 #' predictions, the criterion must be satisfied for each dimension separately.
 #' The stopping criterion uses the fact that standard errors and SHAP values are all
-#' on the same scale. Ignored if exact calculations are done.
+#' on the same scale. Ignored if \code{exact = TRUE}.
 #' @param max_iter If the stopping criterion (see \code{tol}) is not reached after 
-#' \code{max_iter} iterations, the algorithm stops. Ignored if exact calculations are done.
+#' \code{max_iter} iterations, the algorithm stops. Ignored if \code{exact = TRUE}.
 #' @param parallel If \code{TRUE}, use parallel \code{foreach::foreach()} to loop over rows
 #' to be explained. Must register backend beforehand, e.g. via "doFuture" package, 
 #' see Readme for an example. Parallelization automatically disables the progress bar.
@@ -83,12 +124,15 @@
 #'   \item \code{SE}: Standard errors corresponding to \code{S} (and organized like \code{S}).
 #'   \item \code{n_iter}: Integer vector of length n providing the number of iterations per row of \code{X}.
 #'   \item \code{converged}: Logical vector of length n indicating convergence per row of \code{X}.
-#'   \item \code{m}: Integer providing the effective number of on-off vectors used per iteration.
+#'   \item \code{m}: Integer providing the effective number of sampled on-off vectors used per iteration.
+#'   \item \code{m_exact}: Integer providing the effective number of exact on-off vectors used per iteration.
+#'   \item \code{prop_exact}: Proportion of the Kernel SHAP weight distribution covered by exact calculations.
+#'   \item \code{exact}: Logical flag indicating whether calculations are exact or not.
+#'   \item \code{txt}: Summary text.
 #' }
 #' @references
 #' \enumerate{
 #'   \item Ian Covert and Su-In Lee. Improving KernelSHAP: Practical Shapley Value Estimation Using Linear Regression. Proceedings of The 24th International Conference on Artificial Intelligence and Statistics, PMLR 130:3457-3465, 2021.
-#'   \item Scott M. Lundberg and Su-In Lee. A Unified Approach to Interpreting Model Predictions. Advances in Neural Information Processing Systems 30, 2017.
 #'}
 #' @export
 #' @examples
@@ -106,7 +150,7 @@
 #'   as.matrix(iris[1:2]) ~ Petal.Length + Petal.Width + Species, data = iris
 #' )
 #' s <- kernelshap(fit, iris[1:4, 3:5], bg_X = iris)
-#' s
+#' summary(s)
 #'
 #' # Matrix input works as well, and pred_fun can be overwritten
 #' fit <- stats::lm(Sepal.Length ~ ., data = iris[1:4])
@@ -130,7 +174,6 @@
 #' s <- kernelshap(fit, iris[1:2], bg_X = iris, type = "response")
 #' s
 #' 
-
 kernelshap <- function(object, ...){
   UseMethod("kernelshap")
 }
@@ -138,8 +181,11 @@ kernelshap <- function(object, ...){
 #' @describeIn kernelshap Default Kernel SHAP method.
 #' @export
 kernelshap.default <- function(object, X, bg_X, pred_fun = stats::predict, bg_w = NULL, 
-                               paired_sampling = TRUE, m = "auto", exact = "auto", 
-                               l1 = NULL, tol = 0.01, max_iter = 250, parallel = FALSE, 
+                               exact = ncol(X) <= 8L, l1 = NULL,
+                               hybrid_degree = 1L + ncol(X) %in% 4:16, 
+                               paired_sampling = TRUE, 
+                               m = 2L * ncol(X) * (1L + 3L * (hybrid_degree == 0L)), 
+                               tol = 0.005, max_iter = 100L, parallel = FALSE, 
                                parallel_args = NULL, verbose = TRUE, ...) {
   stopifnot(
     is.matrix(X) || is.data.frame(X),
@@ -152,13 +198,14 @@ kernelshap.default <- function(object, X, bg_X, pred_fun = stats::predict, bg_w 
     !is.null(nms <- colnames(X)),
     !is.null(colnames(bg_X)),
     all(nms %in% colnames(bg_X)),
-    is.function(pred_fun)
+    is.function(pred_fun),
+    exact %in% c(TRUE, FALSE),
+    p == 1L || hybrid_degree %in% 0:(p / 2),
+    paired_sampling %in% c(TRUE, FALSE),
+    "m must be even" = trunc(m / 2) == m / 2
   )
   if (!is.null(bg_w)) {
     stopifnot(length(bg_w) == bg_n, all(bg_w >= 0), !all(bg_w == 0))
-  }
-  if (verbose) {
-    check_bg_size(bg_n)
   }
   
   # Calculate v0 and v1
@@ -169,60 +216,53 @@ kernelshap.default <- function(object, X, bg_X, pred_fun = stats::predict, bg_w 
   
   # For p = 1, exact Shapley values are returned
   if (p == 1L) {
-    if (verbose) {
-      message("Calculating exact Shapley values")
-    }
-    return(case_p1(n = n, nms = nms, v0 = v0, v1 = v1, X = X))
+    return(case_p1(n = n, nms = nms, v0 = v0, v1 = v1, X = X, verbose = verbose))
   }
 
-  # Derive "exact" and "m"
-  if (exact == "auto") {
-    exact <- p <= 8L
-  } else if (exact && p > 10L) {
-    warning("Exact calculations with more than ten features might take long because 
-    prediction data sets have about 2^p * nrow(bg_X) rows. Consider setting exact = FALSE")
-  }
-  # Now, "exact" is either TRUE or FALSE
-  if (exact) {
-    if (verbose) {
-      message("Calculating exact Kernel SHAP values")
-    }
-    m <- 2L^p - 2L
+  # Precalculations for the real Kernel SHAP
+  if (exact || hybrid_degree >= 1L) {
+    precalc <- if (exact) input_exact(p) else input_partly_exact(p, hybrid_degree)
+    m_exact <- nrow(precalc[["Z"]])
+    prop_exact <- sum(precalc[["w"]])
+    precalc[["bg_X_exact"]] <- bg_X[rep(seq_len(bg_n), times = m_exact), , drop = FALSE]
   } else {
-    if (verbose) {
-      message("Calculating Kernel SHAP values by iterative sampling")
-    }
-    if (m == "auto") {
-      m <- 2L * max(trunc(20 * sqrt(p)), 5L * p)
-    }
+    precalc <- list()
+    m_exact <- 0L
+    prop_exact <- 0
   }
-  # Make sure that m / 2 is integer in the paired case
-  if (paired_sampling) {
-    m <- 2L * trunc(m / 2L)
+  if (!exact) {
+    precalc[["bg_X_m"]] <- bg_X[rep(seq_len(bg_n), times = m), , drop = FALSE]  
   }
-  ex <- if (exact) exact_input(p)
-
-  # Allocate replicated version of the background data
-  bg_Xm <- bg_X[rep(seq_len(bg_n), times = m), , drop = FALSE]
   
-  # Real work: apply Kernel SHAP to each row of X
+  # Some infos
+  txt <- summarize_strategy(p, exact = exact, deg = hybrid_degree)
+  if (verbose) {
+    message(txt)
+  }
+  if (verbose && max(m, m_exact) * bg_n > 2e5) {
+    warning("\nPredictions on large data sets with ", max(m, m_exact), "x", bg_n,
+            " observations are being done. Consider reducing the computational burden ",
+            "(e.g. exact = FALSE, low hybrid_degree, smaller background data, smaller m)")
+  }
+  
+  # Apply Kernel SHAP to each row of X
   if (isTRUE(parallel)) {
     parallel_args <- c(list(i = seq_len(n)), parallel_args)
     res <- do.call(foreach::foreach, parallel_args) %dorng% kernelshap_one(
+      x = X[i, , drop = FALSE], 
+      v1 = v1[i, , drop = FALSE], 
       object = object,
-      X = X[rep(i, times = nrow(bg_Xm)), , drop = FALSE],
-      bg_X = bg_Xm,
       pred_fun = pred_fun,
       bg_w = bg_w, 
-      v0 = v0,
-      v1 = v1[i, , drop = FALSE],
+      exact = exact,
+      l1 = l1,
+      deg = hybrid_degree,
       paired = paired_sampling,
       m = m,
-      exact = exact,
-      ex = ex,
-      l1 = l1,
       tol = tol,
       max_iter = max_iter,
+      v0 = v0,
+      precalc = precalc,
       ...
     )
   } else {
@@ -232,20 +272,20 @@ kernelshap.default <- function(object, X, bg_X, pred_fun = stats::predict, bg_w 
     res <- vector("list", n)
     for (i in seq_len(n)) {
       res[[i]] <- kernelshap_one(
+        x = X[i, , drop = FALSE], 
+        v1 = v1[i, , drop = FALSE], 
         object = object,
-        X = X[rep(i, times = nrow(bg_Xm)), , drop = FALSE],
-        bg_X = bg_Xm,
         pred_fun = pred_fun,
         bg_w = bg_w, 
-        v0 = v0,
-        v1 = v1[i, , drop = FALSE],
+        exact = exact,
+        l1 = l1,
+        deg = hybrid_degree,
         paired = paired_sampling,
         m = m,
-        exact = exact,
-        ex = ex,
-        l1 = l1,
         tol = tol,
         max_iter = max_iter,
+        v0 = v0,
+        precalc = precalc,
         ...
       )
       if (verbose && n >= 2L) {
@@ -266,7 +306,11 @@ kernelshap.default <- function(object, X, bg_X, pred_fun = stats::predict, bg_w 
     SE = reorganize_list(lapply(res, `[[`, "sigma"), nms = nms), 
     n_iter = vapply(res, `[[`, "n_iter", FUN.VALUE = integer(1L)),
     converged = converged,
-    m = m
+    m = m,
+    m_exact = m_exact,
+    prop_exact = prop_exact,
+    exact = exact || trunc(p / 2) == hybrid_degree,
+    txt = txt
   )
   class(out) <- "kernelshap"
   out
@@ -276,20 +320,27 @@ kernelshap.default <- function(object, X, bg_X, pred_fun = stats::predict, bg_w 
 #' @export
 kernelshap.ranger <- function(object, X, bg_X,
                               pred_fun = function(m, X, ...) stats::predict(m, X, ...)$predictions, 
-                              bg_w = NULL, 
-                              paired_sampling = TRUE, m = "auto", exact = TRUE, 
-                              tol = 0.01, max_iter = 250, verbose = TRUE, ...) {
+                              bg_w = NULL, exact = ncol(X) <= 8L, l1 = NULL,
+                              hybrid_degree = 1L + ncol(X) %in% 4:16, 
+                              paired_sampling = TRUE, 
+                              m = 2L * ncol(X) * (1L + 3L * (hybrid_degree == 0L)), 
+                              tol = 0.005, max_iter = 100L, parallel = FALSE, 
+                              parallel_args = NULL, verbose = TRUE, ...) {
   kernelshap.default(
     object = object, 
     X = X, 
     bg_X = bg_X, 
     pred_fun = pred_fun, 
     bg_w = bg_w, 
-    paired_sampling = paired_sampling, 
+    exact = exact,
+    l1 = l1,
+    hybrid_degree = hybrid_degree,
+    paired_sampling = paired_sampling,
     m = m, 
-    exact = exact, 
     tol = tol, 
     max_iter = max_iter,
+    parallel = parallel,
+    parallel_args = parallel_args, 
     verbose = verbose, 
     ...
   )
@@ -299,20 +350,27 @@ kernelshap.ranger <- function(object, X, bg_X,
 #' @export
 kernelshap.Learner <- function(object, X, bg_X,
                                pred_fun = function(m, X) m$predict_newdata(X)$response, 
-                               bg_w = NULL, 
-                               paired_sampling = TRUE, m = "auto", exact = TRUE, 
-                               tol = 0.01, max_iter = 250, verbose = TRUE, ...) {
+                               bg_w = NULL, exact = ncol(X) <= 8L, l1 = NULL,
+                               hybrid_degree = 1L + ncol(X) %in% 4:16, 
+                               paired_sampling = TRUE, 
+                               m = 2L * ncol(X) * (1L + 3L * (hybrid_degree == 0L)),
+                               tol = 0.005, max_iter = 100L, parallel = FALSE, 
+                               parallel_args = NULL, verbose = TRUE, ...) {
   kernelshap.default(
     object = object, 
     X = X, 
     bg_X = bg_X, 
     pred_fun = pred_fun, 
-    bg_w = bg_w, 
-    paired_sampling = paired_sampling, 
+    bg_w = bg_w,
+    exact = exact,
+    l1 = l1,
+    hybrid_degree = hybrid_degree,
+    paired_sampling = paired_sampling,
     m = m, 
-    exact = exact, 
     tol = tol, 
     max_iter = max_iter,
+    parallel = parallel,
+    parallel_args = parallel_args, 
     verbose = verbose, 
     ...
   )

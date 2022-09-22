@@ -1,72 +1,98 @@
 # Kernel SHAP algorithm for a single row x with paired sampling
-kernelshap_one <- function(object, X, bg_X, pred_fun, bg_w, v0, v1, 
-                           paired, m, exact, ex, l1, tol, max_iter, ...) {
-  p <- ncol(X)
+kernelshap_one <- function(x, v1, object, pred_fun, bg_w, exact, l1, deg, 
+                           paired, m, tol, max_iter, v0, precalc, ...) {
+  p <- ncol(x)
   k <- ncol(v0)
   if (is.null(l1)) {
     keep <- 1:p
   }
   beta <- sigma <- matrix(0, nrow = p, ncol = k)
-  v0_ext <- v0[rep(1L, m), , drop = FALSE]                        #  (m x K)
   
-  if (exact) {
-    Z <- ex[["Z"]]                                                #  (m x p)
-    vz <- get_vz(                                                 #  (m x K)
-      X = X, bg = bg_X, Z = Z, object = object, pred_fun = pred_fun, w = bg_w, ...
+  # Calculate A_exact and b_exact
+  if (exact || deg >= 1L) {
+    A_exact <- precalc[["A"]]                                     #  (p x p)
+    bg_X_exact <- precalc[["bg_X_exact"]]                         #  (m_ex*n_bg x p)
+    Z <- precalc[["Z"]]                                           #  (m_ex x p)
+    m_exact <- nrow(Z)
+    v0_m_exact <- v0[rep(1L, m_exact), , drop = FALSE]            #  (m_ex x K)
+    
+    # Most expensive part
+    vz <- get_vz(                                                 #  (m_ex x K)
+      X = x[rep(1L, times = nrow(bg_X_exact)), , drop = FALSE],   #  (m_ex*n_bg x p)
+      bg = bg_X_exact,                                            #  (m_ex*n_bg x p)
+      Z = Z,                                                      #  (m_ex x p)
+      object = object, 
+      pred_fun = pred_fun, 
+      w = bg_w, 
+      ...
     )
     if (!is.null(l1)) {
-      keep <- l1_reg(Z, vz, v0_ext, l1)
+      keep <- l1_reg(Z, vz, v0_m_exact, l1)
     }
-    # Note: w is correctly replicated along columns of (vz - v0_ext)
-    b <- crossprod(Z[, keep], ex[["w"]] * (vz - v0_ext))         #  (p x K)
-    beta[keep, ] <- solver(ex[["A"]][keep, keep], b, 
-                           constraint = v1 - v0)                 #  (p x K)
+    # Note: w is correctly replicated along columns of (vz - v0_m_exact)
+    b_exact <- crossprod(Z[, keep], 
+                         precalc[["w"]] * (vz - v0_m_exact))      #  (p x K)
     
-    return(list(beta = beta, sigma = 0 * beta, n_iter = 1L, converged = TRUE))
-  }
+    # Some of the hybrid cases are exact as well
+    if (exact || trunc(p / 2) == deg) {
+      beta[keep, ] <- solver(A_exact[keep, keep], b_exact, 
+                             constraint = v1 - v0)                #  (p x K)
+      return(list(beta = beta, sigma = 0 * beta, n_iter = 1L, converged = TRUE))  
+    }
+  } 
   
-  # Now the sampling case
+  # Iterative sampling part, always using A_exact and b_exact to fill up the weights
+  bg_X_m <- precalc[["bg_X_m"]]                                   #  (m*n_bg x p)
+  X <- x[rep(1L, times = nrow(bg_X_m)), , drop = FALSE]           #  (m*n_bg x p)
+  v0_m <- v0[rep(1L, m), , drop = FALSE]                          #  (m x K)
+
   est_m = list()
   converged <- FALSE
   n_iter <- 0L
-  Asum <- matrix(0, nrow = p, ncol = p)                           #  (p x p)
-  bsum <- matrix(0, nrow = p, ncol = k)                           #  (p x K)
+  A_sum <- matrix(0, nrow = p, ncol = p)                          #  (p x p)
+  b_sum <- matrix(0, nrow = p, ncol = k)                          #  (p x K)
+  if (deg == 0L) {
+    A_exact <- A_sum
+    b_exact <- b_sum
+  }
   
   while(!isTRUE(converged) && n_iter < max_iter) {
     n_iter <- n_iter + 1L
-    Z <- sample_Z(m = m, p = p, paired = paired)                  #  (m x p)
-
-    # Expensive                                                   #  (m x K)
+    input <- input_sampling(p = p, m = m, deg = deg, paired = paired)
+    Z <- input[["Z"]]
+      
+    # Expensive                                                              #  (m x K)
     vz <- get_vz(
-      X = X, bg = bg_X, Z = Z, object = object, pred_fun = pred_fun, w = bg_w, ...
+      X = X, bg = bg_X_m, Z = Z, object = object, pred_fun = pred_fun, w = bg_w, ...
     )
     if (!is.null(l1) && n_iter == 1) {
-      keep <- l1_reg(Z, vz, v0_ext, l1)
+      keep <- l1_reg(Z, vz, v0_m, l1)
       Asum <- Asum[keep, keep]
       bsum <- bsum[keep, ]
+      b_exact <- b_exact[keep, ]
     } 
     
-    # Least-squares with constraint that beta_1 + ... + beta_p = v_1 - v_0. 
-    # The additional constraint beta_0 = v_0 is dealt via offset
-    Atemp <- crossprod(Z) / m                                     #  (p x p)
-    Atemp <- Atemp[keep, keep]
-    btemp <- crossprod(Z[, keep], (vz - v0_ext)) / m              #  (p x K)
-    Asum <- Asum + Atemp                                          #  (p x p)
-    bsum <- bsum + btemp                                          #  (p x K)
+    # The sum of weights of A_exact and input[["A"]] is 1, same for b
+    A_temp <- A_exact + input[["A"]]                                         #  (p x p)
+    A_temp <- A_temp[keep, keep]
+    b_temp <- b_exact + crossprod(Z[, keep], input[["w"]] * (vz - v0_m))     #  (p x K)
+    A_sum <- A_sum + A_temp                                                  #  (p x p)
+    b_sum <- b_sum + b_temp                                                  #  (p x K)
     
-    # Constrained regression -> parameter matrix                  #  (p x K)
-    est_m[[n_iter]] <- solver(Atemp, btemp, constraint = v1 - v0)
+    # Least-squares with constraint that beta_1 + ... + beta_p = v_1 - v_0. 
+    # The additional constraint beta_0 = v_0 is dealt via offset   
+    est_m[[n_iter]] <- solver(A_temp, b_temp, constraint = v1 - v0)          #  (p x K)
 
     # Covariance calculation would fail in the first iteration
     if (n_iter >= 2L) {
-      beta_n <- solver(Asum / n_iter, bsum / n_iter, constraint = v1 - v0)  # (p x K)
-      sigma_n <- get_sigma(est_m, iter = n_iter)                            # (p x K)
+      beta_n <- solver(A_sum / n_iter, b_sum / n_iter, constraint = v1 - v0) #  (p x K)
+      sigma_n <- get_sigma(est_m, iter = n_iter)                             #  (p x K)
       converged <- all(conv_crit(sigma_n, beta_n) < tol)
     }
   }
   beta[keep, ] <- beta_n
   sigma[keep, ] <- sigma_n
-  return(list(beta = beta, sigma = sigma, n_iter = n_iter, converged = converged))
+  list(beta = beta_n, sigma = sigma_n, n_iter = n_iter, converged = converged)
 }
 
 # Regression coefficients given sum(beta) = constraint
@@ -74,8 +100,8 @@ kernelshap_one <- function(object, X, bg_X, pred_fun, bg_w, v0, v1,
 solver <- function(A, b, constraint) {
   p <- ncol(A)
   Ainv <- MASS::ginv(A)
-  s <- (matrix(colSums(Ainv %*% b), nrow = 1L) - constraint) / sum(Ainv)  # (1 x K)
-  Ainv %*% (b - s[rep(1L, p), , drop = FALSE])                            # (p x K)
+  s <- (matrix(colSums(Ainv %*% b), nrow = 1L) - constraint) / sum(Ainv)     #  (1 x K)
+  Ainv %*% (b - s[rep(1L, p), , drop = FALSE])                               #  (p x K)
 }
 
 # Calculates all vz of an iteration and thus takes time
@@ -166,22 +192,54 @@ check_pred <- function(x, n) {
   stop("Predictions must be a length n vector or a matrix/data.frame/array with n rows.")
 }
 
-# Informative warning if background data is small or large
-check_bg_size <- function(n) {
-  if (n > 1000L) {
-    warning("Your background data 'bg_X' is large, which will slow down the process. Consider using 100-200 rows.")
-  }
-  if (n < 20L) {
-    warning("Your background data 'bg_X' is small, which might lead to imprecise SHAP values. Consider using 100-200 rows.")
-  }
+# # Is background data too small or large?
+# check_bg_size <- function(n) {
+#   if (n > 1000L) {
+#     message("Your background data 'bg_X' is large, which will slow down the process. Consider using 100-200 rows.")
+#   }
+#   if (n < 20L) {
+#     message("Your background data 'bg_X' is small, which might lead to imprecise SHAP values. Consider using 100-200 rows.")
+#   }
+# }
+
+# # Given p and maximum m, determine hybrid degree (currently not used)
+# find_degree <- function(p, m_max) {
+#   if (p < 2L) {
+#     "p must be at least 2"
+#   }
+#   if (m_max < 2L * p) {
+#     return(list(degree = 0L, m_exact = 0L))
+#   }
+#   # Non-integers are rounded down
+#   S <- seq_len(p / 2)
+#   const <- (2L - (p == 2L * S))
+#   m_kum <- cumsum(const * choose(p, S))
+#   degree <- max(S[m_kum <= m_max])
+#   list(degree = degree, m_exact = m_kum[degree])
+# }
+
+# Helper function in print() and summary()
+head_list <- function(x, n) {
+  if (!is.list(x)) print(utils::head(x, n)) else print(lapply(x, utils::head, n))
 }
 
-# Kernel weights (renormalized without infinite weights for 0 and p)
-kernel_weights <- function(p) {
-  if (p < 2L) {
-    stop("p must be at least two")
+# Describe what is happening
+summarize_strategy <- function(p, exact, deg) {
+  if (exact || trunc(p / 2) == deg) {
+    txt <- "Exact Kernel SHAP values"
+    if (!exact) {
+      txt <- paste(txt, "by the hybrid approach")
+    }
+    return(txt)
   }
-  S <- 1:(p - 1L)
+  if (deg == 0L) {
+    return("Kernel SHAP values by iterative sampling")
+  } 
+  paste("Kernel SHAP values by the hybrid strategy of degree", deg)
+}
+
+# Kernel weights normalized to a non-empty subset S of {1, ..., p-1}
+kernel_weights <- function(p, S = seq_len(p - 1L)) {
   probs <- (p - 1L) / (choose(p, S) * S * (p - S))
   probs / sum(probs)
 }
@@ -189,11 +247,11 @@ kernel_weights <- function(p) {
 # Optional feature selection function
 l1_reg <- function(Z, vz, v0_ext, l1) {
   # Fit weighted lasso
-  n <- nrow(Z)
+  m <- nrow(Z)
   p <- ncol(Z)
   w <- kernel_weights(p) / choose(p, 1:(p - 1L))
   w <- w[rowSums(Z)]
-  w <- w / sum(w) * n
+  w <- w / sum(w) * m
   y <- as.numeric(vz - v0_ext)
   fit <- glmnet(x = Z, y = y, weights = w, intercept = FALSE)
   if (l1 %in% c('aic', 'bic')) {
@@ -205,7 +263,7 @@ l1_reg <- function(Z, vz, v0_ext, l1) {
       sum(dnorm(eps[, l], sd = rmse[l], log = TRUE))
     })
     aic <- 2 * fit$df - 2 * ll
-    bic <- log(n) * fit$df - 2 * ll
+    bic <- log(m) * fit$df - 2 * ll
     k <- ifelse(l1 == 'aic', which.min(aic), which.min(bic))
     keep <- predict.glmnet(fit, s = fit$lambda[k], type = 'nonzero')$s1
   } else {
@@ -222,3 +280,4 @@ l1_reg <- function(Z, vz, v0_ext, l1) {
   }
   return(keep)
 }
+

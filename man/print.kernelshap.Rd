@@ -2,17 +2,14 @@
 % Please edit documentation in R/methods.R
 \name{print.kernelshap}
 \alias{print.kernelshap}
-\title{Prints "kernelshap" Object}
+\title{Print Method}
 \usage{
-\method{print}{kernelshap}(x, compact = FALSE, n = 2L, ...)
+\method{print}{kernelshap}(x, n = 2L, ...)
 }
 \arguments{
 \item{x}{An object of class "kernelshap".}
 
-\item{compact}{Set to \code{TRUE} to hide printing the top n SHAP values,
-standard errors and feature values.}
-
-\item{n}{Maximum number of rows of SHAP values, standard errors and feature values to print.}
+\item{n}{Maximum number of rows of SHAP values to print.}
 
 \item{...}{Further arguments passed from other methods.}
 }
@@ -20,7 +17,7 @@ standard errors and feature values.}
 Invisibly, the input is returned.
 }
 \description{
-Prints "kernelshap" Object
+Prints the first two rows of the matrix (or matrices) of SHAP values.
 }
 \examples{
 fit <- stats::lm(Sepal.Length ~ ., data = iris)
